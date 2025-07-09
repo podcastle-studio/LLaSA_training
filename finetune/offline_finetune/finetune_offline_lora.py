@@ -12,6 +12,8 @@ from transformers import (
     HfArgumentParser,
     default_data_collator,
 )
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+
 from dataclasses import dataclass, field
 from typing import Optional
 import sys
@@ -22,10 +24,52 @@ import numpy as np
 import random
 from datasets import load_dataset
 from functools import partial
+from transformers import TrainingArguments
 
- 
 from peft import LoraConfig, get_peft_model
+import numpy as np
+from sklearn.metrics import accuracy_score
+import torch.nn.functional as F
 
+from functools import partial
+
+
+def compute_metrics(eval_pred, tokenizer):
+    predictions, labels = eval_pred
+
+    # Get the index of <|ANSWER|> token
+    answer_token_id = tokenizer.convert_tokens_to_ids("<|ANSWER|>")
+    
+    # Get logits for the token after <|ANSWER|>
+    predictions = torch.tensor(predictions)
+    pred_ids = torch.argmax(predictions, dim=-1)
+
+    # Extract predicted token immediately after <|ANSWER|>
+    def extract_label(ids):
+        answer_pos = (ids == answer_token_id).nonzero(as_tuple=True)[0]
+        if len(answer_pos) == 0 or answer_pos[0] + 1 >= len(ids):
+            return -100  # ignore
+        return ids[answer_pos[0] + 1].item()
+
+    pred_labels = [extract_label(seq) for seq in pred_ids]
+    true_labels = [extract_label(seq) for seq in labels]
+
+    # Remove ignored
+    filtered = [(p, l) for p, l in zip(pred_labels, true_labels) if l != -100]
+    if not filtered:
+        return {}
+
+    preds, refs = zip(*filtered)
+
+    acc = accuracy_score(refs, preds)
+    precision, recall, f1, _ = precision_recall_fscore_support(refs, preds, average='binary')
+
+    return {
+        "accuracy": acc,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1
+    }
 @dataclass
 class ModelArguments:
     llm_model_name_or_path: Optional[str] = field(default="meta-llama/Llama-3.2-1B-Instruct")
@@ -35,8 +79,34 @@ class ModelArguments:
 class DataArguments:
     data_path: str = field(default=None, metadata={"help": "Root path to the memmap data."})
 
+import torch.nn.functional as F
+
+# class PeftTrainer(Trainer):
+   
+#     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+#         device = next(model.parameters()).device
+#         inputs = {k: v.to(device) for k, v in inputs.items()}
+        
+#         outputs = model(**inputs)
+#         loss = outputs.loss  # Use model's built-in loss
+#         return (loss, outputs) if return_outputs else loss
+    
 @dataclass
 class CustomTrainingArguments(TrainingArguments):
+    optim: str = field(default="adamw_torch_fused")
+    
+    model_max_length: int = field(
+        default=2048,
+        metadata={"help": "Maximum sequence length"},
+    )
+    
+    report_to: Optional[str] = field(
+        default=None, metadata={"help": "The integration to report the results and logs to."}
+    )
+    
+    run_name: Optional[str] = field(
+        default=None, metadata={"help": "The name of the run for logging."}
+    )
     optim: str = field(default="adamw_torch_fused")
     model_max_length: int = field(
         default=2048,
@@ -62,17 +132,17 @@ class TTSDataset(Dataset):
         self.length = self.input_ids.shape[0]
         self.pad_token_id = tokenizer.pad_token_id   
         self.tokenizer = tokenizer
+        special_tokens = [
+        # '<|TEXT_GENERATION_START|>', '<|TEXT_GENERATION_END|>',
+        '<|TEXT_UNDERSTANDING_START|>', '<|TEXT_UNDERSTANDING_END|>',
+        # '<|SPEECH_GENERATION_START|>', '<|SPEECH_GENERATION_END|>',
+        '<|SPEECH_UNDERSTANDING_START|>', '<|SPEECH_UNDERSTANDING_END|>',
+        '<|ANSWER|>'
+    ]
+        tokenizer.add_tokens(special_tokens)
+        self.text_understanding_start_id, self.text_understanding_end_id, self.speech_understanding_start_id, self.speech_understanding_end_id, self.answer_start_id = tokenizer.convert_tokens_to_ids(special_tokens)
 
-        self.speech_generation_start_id = tokenizer.convert_tokens_to_ids('<|SPEECH_GENERATION_START|>')
-        self.speech_generation_end_id = tokenizer.convert_tokens_to_ids('<|SPEECH_GENERATION_END|>')
-        self.text_generation_start_id = tokenizer.convert_tokens_to_ids('<|TEXT_GENERATION_START|>')
-        self.text_generation_end_id = tokenizer.convert_tokens_to_ids('<|TEXT_GENERATION_END|>')
-        self.text_understanding_start_id = tokenizer.convert_tokens_to_ids('<|TEXT_UNDERSTANDING_START|>')
-        self.text_understanding_end_id = tokenizer.convert_tokens_to_ids('<|TEXT_UNDERSTANDING_END|>')
-        self.speech_understanding_start_id = tokenizer.convert_tokens_to_ids('<|SPEECH_UNDERSTANDING_START|>')
-        self.speech_understanding_end_id = tokenizer.convert_tokens_to_ids('<|SPEECH_UNDERSTANDING_END|>')
-
-        self.max_length = 2048
+        self.max_length = 2532 + 43
         self.ignore_index = -100  
 
     def __len__(self):
@@ -93,34 +163,32 @@ class TTSDataset(Dataset):
         input_ids = torch.tensor(self.input_ids[idx], dtype=torch.long)
         labels = torch.full_like(input_ids, self.ignore_index)
 
-        speech_gen_positions = (input_ids == self.speech_generation_start_id).nonzero(as_tuple=True)[0]
-        text_gen_positions = (input_ids == self.text_generation_start_id).nonzero(as_tuple=True)[0]
+        speech_understanding_end_positions = (input_ids == self.speech_understanding_end_id).nonzero(as_tuple=True)[0]
+        speech_understand_end_idx = speech_understanding_end_positions[0].item()
 
-        speech_gen_idx = speech_gen_positions[0].item()
-        try:
-            speech_gen_end_idx = (input_ids == self.speech_generation_end_id).nonzero(as_tuple=True)[0].item()
-        except Exception as e:
-            print(f"maybe Error in speech_gen_end_idx: {e}")
-            speech_gen_end_idx = 2048
-
-        text_sequence = input_ids[:speech_gen_idx]
-        speech_sequence = input_ids[speech_gen_idx : speech_gen_end_idx + 1]
+        text_speech_sequence = input_ids[:speech_understand_end_idx + 1]
+       
+        answer_start_positions = (input_ids == self.answer_start_id).nonzero(as_tuple=True)[0]
+        answer_start_idx = answer_start_positions[0].item()
+        
+        # speech_understand_end_idx = speech_understanding_end_positions[0].item()
+        answer_sequence = input_ids[answer_start_idx:]
 
         chat = [
-            {"role": "user", "content": "Convert the text to speech:<|TEXT_UNDERSTANDING_START|>"},
-            {"role": "assistant", "content": "<|SPEECH_GENERATION_START|>"}
+            {"role": "user", "content": "Detect hallucination in the speech:<|TEXT_UNDERSTANDING_START|>"},
+            {"role": "assistant", "content": "<|ANSWER|>"}
         ]
         ids = self.tokenizer.apply_chat_template(chat, tokenize=True)
 
-        ids = self.replace_tagged_token(ids, self.text_understanding_start_id, text_sequence)
-        ids = self.replace_tagged_token(ids, self.speech_generation_start_id, speech_sequence)
+        ids = self.replace_tagged_token(ids, self.text_understanding_start_id, text_speech_sequence)
+        ids = self.replace_tagged_token(ids, self.answer_start_id, answer_sequence)
 
         input_ids = torch.tensor(ids, dtype=torch.long)
         labels = torch.full_like(input_ids, self.ignore_index)
 
         try:
-            speech_gen_idx_in_input = (input_ids == self.speech_generation_start_id).nonzero(as_tuple=True)[0].item()
-            labels[speech_gen_idx_in_input:] = input_ids[speech_gen_idx_in_input:]
+            answer_idx_in_input = (input_ids == self.answer_start_id).nonzero(as_tuple=True)[0].item()
+            labels[answer_idx_in_input:] = input_ids[answer_idx_in_input:]
         except Exception as e:
             print(f"maybe Error in speech_gen_idx_in_input: {e}")
             labels = input_ids 
@@ -133,10 +201,11 @@ class TTSDataset(Dataset):
         labels = self.pad_sequence(labels, self.max_length, value=self.ignore_index)
 
         return {
-            'input_ids': list(input_ids),
-            'labels': list(labels),
-            'attention_mask': list(attention_mask)
+            'input_ids': input_ids,
+            'labels': labels,
+            'attention_mask': attention_mask
         }
+
 
 def main():
     # 解析参数
@@ -149,7 +218,7 @@ def main():
             training_args,
         ) = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
-        default_config_file = 'config_lora.json'
+        default_config_file = 'finetune/offline_finetune/config_lora.json'
         (
             model_args,
             data_args,
@@ -159,7 +228,7 @@ def main():
     is_main_process = training_args.local_rank in [-1, 0]
     if training_args.report_to == "wandb" and is_main_process:
         wandb.init(
-            project="llm_tts",  
+            project="llm_audio_classification",  
             config=training_args.to_sanitized_dict(),
             name=training_args.run_name
         )
@@ -174,9 +243,10 @@ def main():
         model_args.llm_model_name_or_path,
         torch_dtype='auto',
         cache_dir=model_args.cache_dir,
+        trust_remote_code=True,
+        model_type="llama"
     )
 
- 
     lora_config = LoraConfig(
         r=8,                      
         lora_alpha=32,           
@@ -186,6 +256,7 @@ def main():
         task_type="CAUSAL_LM"
     )
     model = get_peft_model(model, lora_config)
+    
     print("LoRA微调模型参数信息：")
     model.print_trainable_parameters()
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -203,7 +274,14 @@ def main():
         tokenizer=tokenizer
     ) if os.path.exists(os.path.join(data_args.data_path, 'val_input_ids.memmap')) else None
 
+    model.resize_token_embeddings(len(tokenizer))
     data_collator = default_data_collator
+
+    # device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    # model.to(device)
+    
+    # print("Model train mode:", model.training)
+    # print("Some param requires_grad:", any(p.requires_grad for p in model.parameters()))
 
     trainer = Trainer(
         model=model,
@@ -212,10 +290,9 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
+        compute_metrics=partial(compute_metrics, tokenizer=tokenizer),
     )
-    if is_main_process:
-        trainer.add_callback(transformers.integrations.WandbCallback())
-
+   
     trainer.train()
     trainer.save_model(training_args.output_dir)
     tokenizer.save_pretrained(training_args.output_dir)

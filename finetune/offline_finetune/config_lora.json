@@ -1,13 +1,15 @@
 {
   "llm_model_name_or_path": "HKUSTAudio/Llasa-1B",
-  "data_path": "/aifs4su/data/zheny/opensource/LJSpeech-1.1/ljspeech_bin",
+
+  "data_path": "../xcodec_2/",
   "bf16": true,
-  "output_dir": "/aifs4su/data/zheny/opensource/LLaSA_training/finetune/results_tts_lora",
+  "fp16": false,
+  "output_dir": "./finetuneLogs/results_lora_0.1",
   "num_train_epochs": 2,
-  "per_device_train_batch_size": 4,
-  "per_device_eval_batch_size": 4,
+  "per_device_train_batch_size": 1,
+  "per_device_eval_batch_size": 1,
   "gradient_accumulation_steps": 1,
-  "evaluation_strategy": "steps",
+  "eval_strategy": "steps",
   "eval_steps": 5000,
   "save_strategy": "steps",
   "save_steps": 5000,
@@ -19,9 +21,8 @@
   "lr_scheduler_type": "cosine",
   "logging_steps": 10,
   "report_to": "wandb",
-  "model_max_length": 2048,
+  "model_max_length": 2532,
   "gradient_checkpointing": false,
   "dataloader_num_workers": 4,
-  "dataloader_prefetch_factor": 4,
-  "deepspeed":"ds_config_zero2.json"
+  "dataloader_prefetch_factor": 4
 }
