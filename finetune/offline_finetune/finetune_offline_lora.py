@@ -32,44 +32,51 @@ from sklearn.metrics import accuracy_score
 import torch.nn.functional as F
 
 from functools import partial
+from torch.utils.data import DataLoader
+import torch.nn.functional as F
+
 
 
 def compute_metrics(eval_pred, tokenizer):
     predictions, labels = eval_pred
 
-    # Get the index of <|ANSWER|> token
     answer_token_id = tokenizer.convert_tokens_to_ids("<|ANSWER|>")
     
-    # Get logits for the token after <|ANSWER|>
-    predictions = torch.tensor(predictions)
-    pred_ids = torch.argmax(predictions, dim=-1)
+    pred_ids = np.argmax(predictions, axis=-1)  # Use NumPy instead of torch
+    labels = np.array(labels)
 
-    # Extract predicted token immediately after <|ANSWER|>
     def extract_label(ids):
-        answer_pos = (ids == answer_token_id).nonzero(as_tuple=True)[0]
-        if len(answer_pos) == 0 or answer_pos[0] + 1 >= len(ids):
-            return -100  # ignore
-        return ids[answer_pos[0] + 1].item()
+        try:
+            answer_pos = np.where(ids == answer_token_id)[0]
+            if len(answer_pos) == 0 or answer_pos[0] + 1 >= len(ids):
+                return -100
+            return ids[answer_pos[0] + 1]
+        except Exception:
+            return -100
 
     pred_labels = [extract_label(seq) for seq in pred_ids]
     true_labels = [extract_label(seq) for seq in labels]
 
-    # Remove ignored
-    filtered = [(p, l) for p, l in zip(pred_labels, true_labels) if l != -100]
+    pos_label_id = 9891
+    binary_preds = [1 if p == pos_label_id else 0 for p in pred_labels]
+    binary_refs = [1 if r == pos_label_id else 0 for r in true_labels]
+
+    filtered = [(p, l) for p, l in zip(binary_preds, binary_refs) if l != -100]
     if not filtered:
-        return {}
+        return {"accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0}
 
     preds, refs = zip(*filtered)
 
     acc = accuracy_score(refs, preds)
     precision, recall, f1, _ = precision_recall_fscore_support(refs, preds, average='binary')
+    
+    # Manual cleanup
+    del predictions, labels, pred_ids, pred_labels, true_labels
+    import gc; gc.collect()
 
-    return {
-        "accuracy": acc,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1
-    }
+    return {"accuracy": acc, "precision": precision, "recall": recall, "f1": f1}
+
+
 @dataclass
 class ModelArguments:
     llm_model_name_or_path: Optional[str] = field(default="meta-llama/Llama-3.2-1B-Instruct")
@@ -79,18 +86,7 @@ class ModelArguments:
 class DataArguments:
     data_path: str = field(default=None, metadata={"help": "Root path to the memmap data."})
 
-import torch.nn.functional as F
-
-# class PeftTrainer(Trainer):
-   
-#     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-#         device = next(model.parameters()).device
-#         inputs = {k: v.to(device) for k, v in inputs.items()}
-        
-#         outputs = model(**inputs)
-#         loss = outputs.loss  # Use model's built-in loss
-#         return (loss, outputs) if return_outputs else loss
-    
+ 
 @dataclass
 class CustomTrainingArguments(TrainingArguments):
     optim: str = field(default="adamw_torch_fused")
@@ -142,7 +138,7 @@ class TTSDataset(Dataset):
         tokenizer.add_tokens(special_tokens)
         self.text_understanding_start_id, self.text_understanding_end_id, self.speech_understanding_start_id, self.speech_understanding_end_id, self.answer_start_id = tokenizer.convert_tokens_to_ids(special_tokens)
 
-        self.max_length = 2532 + 43
+        self.max_length = 790 + 43
         self.ignore_index = -100  
 
     def __len__(self):
@@ -188,13 +184,14 @@ class TTSDataset(Dataset):
 
         try:
             answer_idx_in_input = (input_ids == self.answer_start_id).nonzero(as_tuple=True)[0].item()
-            labels[answer_idx_in_input:] = input_ids[answer_idx_in_input:]
+            labels[answer_idx_in_input+1:] = input_ids[answer_idx_in_input+1:]
         except Exception as e:
             print(f"maybe Error in speech_gen_idx_in_input: {e}")
             labels = input_ids 
 
         attention_mask = (input_ids != self.pad_token_id).long()
         labels[input_ids == self.pad_token_id] = self.ignore_index
+        labels[answer_idx_in_input+2] = self.pad_token_id
 
         input_ids = self.pad_sequence(input_ids, self.max_length, value=self.pad_token_id)
         attention_mask = self.pad_sequence(attention_mask, self.max_length, value=0)
@@ -273,15 +270,9 @@ def main():
         split='val',
         tokenizer=tokenizer
     ) if os.path.exists(os.path.join(data_args.data_path, 'val_input_ids.memmap')) else None
-
+    
     model.resize_token_embeddings(len(tokenizer))
     data_collator = default_data_collator
-
-    # device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    # model.to(device)
-    
-    # print("Model train mode:", model.training)
-    # print("Some param requires_grad:", any(p.requires_grad for p in model.parameters()))
 
     trainer = Trainer(
         model=model,
@@ -290,8 +281,9 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
-        compute_metrics=partial(compute_metrics, tokenizer=tokenizer),
+        #compute_metrics=partial(compute_metrics, tokenizer=tokenizer),
     )
+
    
     trainer.train()
     trainer.save_model(training_args.output_dir)
