@@ -5,6 +5,7 @@ from transformers import AutoTokenizer
 from tqdm import tqdm
 import multiprocessing
 import random
+import json
 
 # Global config
 MAX_SEQ_LEN = 791
@@ -74,7 +75,7 @@ def process_audio_id(audio_id):
         constant_values=tokenizer.pad_token_id
     )
 
-    return total_input_ids.astype(np.int32), len(text_input_ids) + len(code_input_ids) + len(label_ids_with_eos)
+    return total_input_ids.astype(np.int32), len(text_input_ids) + len(code_input_ids) + len(label_ids_with_eos), audio_id
 
 
 def process_data(transcriptions, code_root, output_dir_tts, num_processes=4):
@@ -110,7 +111,7 @@ def process_data(transcriptions, code_root, output_dir_tts, num_processes=4):
             res = process_audio_id(audio_ids[i])
             if res is not None:
                 selected_ids.append(audio_ids[i])
-                processed_data.append(res)
+                processed_data.append((res[0], res[1]))
             i += 1
         if len(selected_ids) < target_count:
             raise RuntimeError(f"Only {len(selected_ids)} samples found for one class, need {target_count}")
@@ -146,6 +147,8 @@ def process_data(transcriptions, code_root, output_dir_tts, num_processes=4):
         ))
 
     train_tts_input_ids_list = [res[0] for res in results if res is not None]
+    train_ids = [res[2] for res in results if res is not None]
+
     train_lengths = [res[1] for res in results if res is not None]
 
     if not (train_tts_input_ids_list and val_tts_input_ids_list):
@@ -162,13 +165,18 @@ def process_data(transcriptions, code_root, output_dir_tts, num_processes=4):
   
 
     # Save memmaps
-    np.memmap(os.path.join(output_dir_tts, 'train_input_ids.memmap'),
+    np.memmap(os.path.join(output_dir_tts, 'train_input_ids_new.memmap'),
               dtype='int32', mode='w+', shape=train_arr.shape)[:] = train_arr
-    np.memmap(os.path.join(output_dir_tts, 'val_input_ids.memmap'),
+    np.memmap(os.path.join(output_dir_tts, 'val_input_ids_new.memmap'),
               dtype='int32', mode='w+', shape=val_arr.shape)[:] = val_arr
+    with open(os.path.join(output_dir_tts, 'val_audio_ids.json'), 'w') as f:
+        json.dump(val_audio_ids, f)
+    with open(os.path.join(output_dir_tts, 'train_audio_ids.json'), 'w') as f:
+        json.dump(train_ids, f)
+    
 
-    np.save(os.path.join(output_dir_tts, 'train_input_ids_shape.npy'), train_arr.shape)
-    np.save(os.path.join(output_dir_tts, 'val_input_ids_shape.npy'), val_arr.shape)
+    # np.save(os.path.join(output_dir_tts, 'train_input_ids_shape_new.npy'), train_arr.shape)
+    # np.save(os.path.join(output_dir_tts, 'val_input_ids_shape_new.npy'), val_arr.shape)
 
     print(f"Train: {train_arr.shape}, Val: {val_arr.shape}")
     print("TTS memmaps saved to", output_dir_tts)
