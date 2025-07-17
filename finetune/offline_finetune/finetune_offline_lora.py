@@ -426,25 +426,20 @@ def main():
         task_type="CAUSAL_LM"
     )
 
-    train_dataset = TTSDataset(
-        data_path=data_args.data_path,
-        split='train',
-        tokenizer=tokenizer
-    )
+    
 
-    model.resize_token_embeddings(len(tokenizer))
-    model = PeftModel.from_pretrained(model, "finetuneLogs/results_lora_0.12/checkpoint-15000", inference_mode=False)
+    # model.resize_token_embeddings(len(tokenizer))
+    # model = PeftModel.from_pretrained(model, "finetuneLogs/results_lora_0.12/checkpoint-15000", inference_mode=False)
     print("PEFT Configs:", model.peft_config)
-    # model = get_peft_model(model, lora_config)
-    model.peft_config['default'].inference_mode = False
-    print("PEFT Configs:", model.peft_config)
+    model = get_peft_model(model, lora_config)
+    #model.peft_config['default'].inference_mode = False
+    #print("PEFT Configs:", model.peft_config)
 
     # update model parameters to require grad
-    #model.enable_adapter_training()
-    for name, param in model.named_parameters():
-        # LoRA parameters usually have 'lora_' in their name
-        if "lora_" in name:
-            param.requires_grad = True
+    # for name, param in model.named_parameters():
+    #     # LoRA parameters usually have 'lora_' in their name
+    #     if "lora_" in name:
+    #         param.requires_grad = True
 
     
     print("LoRA微调模型参数信息：")
@@ -454,6 +449,11 @@ def main():
     print("Number of trainable parameters:", trainable_params)
 
     # 测试获取一个样本，确保数据正确
+    train_dataset = TTSDataset(
+        data_path=data_args.data_path,
+        split='train',
+        tokenizer=tokenizer
+    )
     _ = train_dataset[0]
     eval_dataset = TTSDataset(
         data_path=data_args.data_path,
@@ -461,7 +461,7 @@ def main():
         tokenizer=tokenizer
     ) if os.path.exists(os.path.join(data_args.data_path, 'val_input_ids.memmap')) else None
     
-    # model.resize_token_embeddings(len(tokenizer))
+    model.resize_token_embeddings(len(tokenizer))
     data_collator = default_data_collator
 
     trainer = Trainer(
