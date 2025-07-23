@@ -41,6 +41,70 @@ from transformers import TrainerCallback
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
+import numpy as np
+import torch
+from torch.utils.data import WeightedRandomSampler, DataLoader
+
+class CustomTrainer(Trainer):
+    def __init__(self, *args, sampler=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sampler = sampler
+
+    def get_train_dataloader(self):
+        if self.sampler is None:
+            return super().get_train_dataloader()
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.args.per_device_train_batch_size,
+            sampler=self.sampler,
+            collate_fn=self.data_collator,
+            drop_last=self.args.dataloader_drop_last,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory
+        )
+
+
+def get_class_labels(dataset):
+    labels = []
+    yes_token_id = 9891  # "yes"
+    no_token_id = 2201   # "no"
+    
+    for idx in range(len(dataset)):
+        item = dataset[idx]
+        input_ids = item['input_ids']
+        answer_start_positions = (input_ids == dataset.answer_start_id).nonzero(as_tuple=True)[0]
+        if len(answer_start_positions) > 0:
+            answer_idx = answer_start_positions[0].item()
+            answer_token = input_ids[answer_idx + 1].item()  # Token after <Answer>
+            if answer_token == yes_token_id:
+                labels.append('yes')
+            elif answer_token == no_token_id:
+                labels.append('no')
+            else:
+                raise ValueError(f"Unexpected answer token: {answer_token}")
+        else:
+            raise ValueError("No <Answer> token found in sample")
+    return labels
+
+def compute_sampler_weights(labels):
+    N_yes = 4250
+    N_no = 18448
+    weights = []
+    for label in labels:
+        if label == 'yes':
+            weights.append(1.0 / N_yes)  # Higher weight for minority class
+        else:
+            weights.append(1.0 / N_no)   # Lower weight for majority class
+    return weights
+
+def create_sampler(weights):
+    sampler = WeightedRandomSampler(
+        weights=weights,
+        num_samples=len(weights),  # Total samples to draw per epoch
+        replacement=True  # Allow oversampling
+    )
+    return sampler
+
 
 # class WeightedLossTrainer(Trainer):
 #     def __init__(self, *args, yes_id=9891, no_id=2201, yes_weight=2.670, no_weight=0.616, **kwargs):
@@ -418,7 +482,7 @@ def main():
     )
 
     lora_config = LoraConfig(
-        r=8,                      
+        r=32,                      
         lora_alpha=32,           
         target_modules=["q_proj", "v_proj"],   
         lora_dropout=0.1,
@@ -430,7 +494,6 @@ def main():
 
     # model.resize_token_embeddings(len(tokenizer))
     # model = PeftModel.from_pretrained(model, "finetuneLogs/results_lora_0.12/checkpoint-15000", inference_mode=False)
-    print("PEFT Configs:", model.peft_config)
     model = get_peft_model(model, lora_config)
     #model.peft_config['default'].inference_mode = False
     #print("PEFT Configs:", model.peft_config)
@@ -447,13 +510,19 @@ def main():
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("Number of trainable parameters:", trainable_params)
-
     # 测试获取一个样本，确保数据正确
     train_dataset = TTSDataset(
         data_path=data_args.data_path,
         split='train',
         tokenizer=tokenizer
     )
+    labels = get_class_labels(train_dataset)
+
+    # Compute weights
+    weights = compute_sampler_weights(labels)
+
+    # Create sampler
+    sampler = create_sampler(weights)
     _ = train_dataset[0]
     eval_dataset = TTSDataset(
         data_path=data_args.data_path,
@@ -464,20 +533,30 @@ def main():
     model.resize_token_embeddings(len(tokenizer))
     data_collator = default_data_collator
 
-    trainer = Trainer(
-        model=model,
-        tokenizer=tokenizer,
-        args=training_args,
-        train_dataset=train_dataset,
-        data_collator=data_collator,
-        callbacks=[ManualEvalCallback(eval_dataset=eval_dataset, tokenizer=tokenizer, eval_every_n_steps=1000)],  # eval every 500 steps (adjust as you want)
-         # Optional: specify a checkpoint to resume training
+    trainer = CustomTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            args=training_args,
+            train_dataset=train_dataset,
+            data_collator=data_collator,
+            callbacks=[ManualEvalCallback(eval_dataset=eval_dataset, tokenizer=tokenizer, eval_every_n_steps=1000)],
+            sampler=sampler  # Pass the sampler
+        )
 
-        #compute_metrics=partial(compute_metrics, tokenizer=tokenizer),
-    )
+    # trainer = Trainer(
+    #     model=model,
+    #     tokenizer=tokenizer,
+    #     args=training_args,
+    #     train_dataset=train_dataset,
+    #     data_collator=data_collator,
+    #     callbacks=[ManualEvalCallback(eval_dataset=eval_dataset, tokenizer=tokenizer, eval_every_n_steps=1000)],  # eval every 500 steps (adjust as you want)
+    #      # Optional: specify a checkpoint to resume training
+
+    #     #compute_metrics=partial(compute_metrics, tokenizer=tokenizer),
+    # )
 
    
-    trainer.train(resume_from_checkpoint="finetuneLogs/results_lora_0.12/checkpoint-15000", )
+    trainer.train()
     trainer.save_model(training_args.output_dir)
     tokenizer.save_pretrained(training_args.output_dir)
 

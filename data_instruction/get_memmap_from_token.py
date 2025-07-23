@@ -165,18 +165,18 @@ def process_data(transcriptions, code_root, output_dir_tts, num_processes=4):
   
 
     # Save memmaps
-    np.memmap(os.path.join(output_dir_tts, 'train_input_ids_new.memmap'),
+    np.memmap(os.path.join(output_dir_tts, 'train_input_ids_diff.memmap'),
               dtype='int32', mode='w+', shape=train_arr.shape)[:] = train_arr
-    np.memmap(os.path.join(output_dir_tts, 'val_input_ids_new.memmap'),
+    np.memmap(os.path.join(output_dir_tts, 'val_input_ids_diff.memmap'),
               dtype='int32', mode='w+', shape=val_arr.shape)[:] = val_arr
-    with open(os.path.join(output_dir_tts, 'val_audio_ids.json'), 'w') as f:
+    with open(os.path.join(output_dir_tts, 'val_audio_ids_diff.json'), 'w') as f:
         json.dump(val_audio_ids, f)
-    with open(os.path.join(output_dir_tts, 'train_audio_ids.json'), 'w') as f:
+    with open(os.path.join(output_dir_tts, 'train_audio_ids_diff.json'), 'w') as f:
         json.dump(train_ids, f)
     
 
-    # np.save(os.path.join(output_dir_tts, 'train_input_ids_shape_new.npy'), train_arr.shape)
-    # np.save(os.path.join(output_dir_tts, 'val_input_ids_shape_new.npy'), val_arr.shape)
+    np.save(os.path.join(output_dir_tts, 'train_input_ids_shape_diff.npy'), train_arr.shape)
+    np.save(os.path.join(output_dir_tts, 'val_input_ids_shape_diff.npy'), val_arr.shape)
 
     print(f"Train: {train_arr.shape}, Val: {val_arr.shape}")
     print("TTS memmaps saved to", output_dir_tts)
@@ -184,7 +184,7 @@ def process_data(transcriptions, code_root, output_dir_tts, num_processes=4):
 
 if __name__ == "__main__":
     code_root = '../xcodec_2/vq_codes'
-    trans_file = '../xcodec_2/output.csv'
+    trans_file = '../xcodec_2/output_diff.csv'
     output_dir_tts = '../xcodec_2'
     num_processes = 8
 
