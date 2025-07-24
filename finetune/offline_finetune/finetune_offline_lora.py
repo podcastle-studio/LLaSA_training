@@ -39,11 +39,14 @@ from peft import PeftModel, PeftConfig
 from transformers import TrainerCallback
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 
 import numpy as np
 import torch
 from torch.utils.data import WeightedRandomSampler, DataLoader
+
+os.environ["WANDB_API_KEY"] = "7e736513f362d4a177034e6a289d2a442d305487"
+os.environ["WANDB_PROJECT"] = "huggingface"
 
 class CustomTrainer(Trainer):
     def __init__(self, *args, sampler=None, **kwargs):
@@ -494,7 +497,7 @@ def main():
 
     # model.resize_token_embeddings(len(tokenizer))
     # model = PeftModel.from_pretrained(model, "finetuneLogs/results_lora_0.12/checkpoint-15000", inference_mode=False)
-    model = get_peft_model(model, lora_config)
+    #model = get_peft_model(model, lora_config)
     #model.peft_config['default'].inference_mode = False
     #print("PEFT Configs:", model.peft_config)
 
@@ -505,12 +508,11 @@ def main():
     #         param.requires_grad = True
 
     
-    print("LoRA微调模型参数信息：")
-    model.print_trainable_parameters()
+    # print("LoRA微调模型参数信息：")
+    # model.print_trainable_parameters()
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print("Number of trainable parameters:", trainable_params)
-    # 测试获取一个样本，确保数据正确
+    print("Number of trainable parameters:", trainable_params)    # 测试获取一个样本，确保数据正确
     train_dataset = TTSDataset(
         data_path=data_args.data_path,
         split='train',
