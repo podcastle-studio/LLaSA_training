@@ -39,7 +39,7 @@ from peft import PeftModel, PeftConfig
 from transformers import TrainerCallback
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import numpy as np
 import torch
@@ -373,12 +373,11 @@ class TTSDataset(Dataset):
         '<|TEXT_UNDERSTANDING_START|>', '<|TEXT_UNDERSTANDING_END|>',
         # '<|SPEECH_GENERATION_START|>', '<|SPEECH_GENERATION_END|>',
         '<|SPEECH_UNDERSTANDING_START|>', '<|SPEECH_UNDERSTANDING_END|>',
-        '<|ANSWER|>'
-    ]
+        '<|ANSWER|>'] + [f"<WARP{i}>" for i in range(5)]  # Add WARP tokens
         tokenizer.add_tokens(special_tokens)
-        self.text_understanding_start_id, self.text_understanding_end_id, self.speech_understanding_start_id, self.speech_understanding_end_id, self.answer_start_id = tokenizer.convert_tokens_to_ids(special_tokens)
+        self.text_understanding_start_id, self.text_understanding_end_id, self.speech_understanding_start_id, self.speech_understanding_end_id, self.answer_start_id, _, _, _, _, _= tokenizer.convert_tokens_to_ids(special_tokens)
 
-        self.max_length = 790 + 43
+        self.max_length = 790 + 43 + 10
         self.ignore_index = -100  
 
     def __len__(self):
@@ -412,7 +411,7 @@ class TTSDataset(Dataset):
 
         chat = [
             {"role": "user", "content": "Detect hallucination in the speech:<|TEXT_UNDERSTANDING_START|>"},
-            {"role": "assistant", "content": "<|ANSWER|>"}
+            {"role": "assistant", "content": "<WARP0> <WARP1> <WARP2> <WARP3> <WARP4> <|ANSWER|>"}
         ]
         ids = self.tokenizer.apply_chat_template(chat, tokenize=True)
 
@@ -511,8 +510,7 @@ def main():
     # print("LoRA微调模型参数信息：")
     # model.print_trainable_parameters()
 
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print("Number of trainable parameters:", trainable_params)    # 测试获取一个样本，确保数据正确
+    
     train_dataset = TTSDataset(
         data_path=data_args.data_path,
         split='train',
@@ -532,8 +530,35 @@ def main():
         tokenizer=tokenizer
     ) if os.path.exists(os.path.join(data_args.data_path, 'val_input_ids.memmap')) else None
     
-    model.resize_token_embeddings(len(tokenizer))
     data_collator = default_data_collator
+    warp_tokens = [f"<WARP{i}>" for i in range(5)]
+
+    tokenizer.add_tokens(warp_tokens)
+    model.resize_token_embeddings(len(tokenizer))
+
+    # Get embedding layer
+    embedding = model.get_input_embeddings()
+
+    # Get WARP token ids
+    warp_token_ids = tokenizer.convert_tokens_to_ids(warp_tokens)
+    warp_token_ids = torch.tensor(warp_token_ids)
+
+    # Freeze entire model
+    model.requires_grad_(False)
+
+    # Unfreeze whole embedding matrix just for now
+    embedding.weight.requires_grad = True
+
+    # Register a backward hook to zero out gradients for all non-WARP tokens
+    def zero_out_gradients_except_warp(grad):
+        mask = torch.zeros_like(grad)
+        mask[warp_token_ids] = 1
+        return grad * mask
+
+    embedding.weight.register_hook(zero_out_gradients_except_warp)
+
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print("Number of trainable parameters:", trainable_params)    # 测试获取一个样本，确保数据正确
 
     trainer = CustomTrainer(
             model=model,
