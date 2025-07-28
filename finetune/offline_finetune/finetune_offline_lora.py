@@ -45,9 +45,6 @@ import numpy as np
 import torch
 from torch.utils.data import WeightedRandomSampler, DataLoader
 
-os.environ["WANDB_API_KEY"] = "7e736513f362d4a177034e6a289d2a442d305487"
-os.environ["WANDB_PROJECT"] = "huggingface"
-
 class CustomTrainer(Trainer):
     def __init__(self, *args, sampler=None, **kwargs):
         super().__init__(*args, **kwargs)
