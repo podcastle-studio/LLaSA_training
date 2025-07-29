@@ -62,7 +62,58 @@ class CustomTrainer(Trainer):
             num_workers=self.args.dataloader_num_workers,
             pin_memory=self.args.dataloader_pin_memory
         )
+    
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        outputs = model(**inputs, output_attentions=True)
+        logits = outputs.logits  # (batch_size, seq_len, vocab_size)
+        labels = inputs["labels"]  # (batch_size, seq_len)
+        input_ids = inputs["input_ids"]
 
+        # Shift labels and logits for CLM
+        labels = nn.functional.pad(labels, (0, 1), value=self.train_dataset.ignore_index)
+        shifted_labels = labels[..., 1:].contiguous()  # labels[i] = input_ids[i+1]
+
+        # Create mask and shift it to align with labels
+        mask = torch.zeros_like(shifted_labels, dtype=torch.float).to(logits.device)
+        text_end_id = self.train_dataset.text_understanding_end_id
+        speech_start_id = self.train_dataset.speech_understanding_start_id
+        speech_end_id = self.train_dataset.speech_understanding_end_id
+        answer_start_id = self.train_dataset.answer_start_id
+        
+        batch_size = labels.size(0)
+        for i in range(batch_size):
+            text_end_idx = (input_ids[i] == text_end_id).nonzero(as_tuple=True)[0]
+            speech_start_idx = (input_ids[i] == speech_start_id).nonzero(as_tuple=True)[0]
+            speech_end_idx = (input_ids[i] == speech_end_id).nonzero(as_tuple=True)[0]
+            answer_idx = (input_ids[i] == answer_start_id).nonzero(as_tuple=True)[0]
+            
+            if len(text_end_idx) > 0 and text_end_idx[0] < labels.size(1) - 1:
+                mask[i, :text_end_idx[0] + 1] = 0.1  # Text tokens
+            if len(speech_start_idx) > 0 and len(speech_end_idx) > 0 and speech_end_idx[0] < labels.size(1) - 1:
+                mask[i, speech_start_idx[0]:speech_end_idx[0] + 1] = 0.2  # Audio tokens
+            if len(answer_idx) > 0 and answer_idx[0] < labels.size(1) - 1:
+                mask[i, answer_idx[0]] = 0.5  # <ANSWER> token
+                if answer_idx[0] + 1 < labels.size(1) - 1:
+                    mask[i, answer_idx[0] + 1] = 1.0  # "yes"/"no" token
+                if answer_idx[0] + 2 < labels.size(1) - 1:
+                    mask[i, answer_idx[0] + 2] = 0.5  # EOS token
+        
+        # Shift mask to align with shifted labels
+        shifted_mask = torch.zeros_like(mask, dtype=torch.float).to(logits.device)
+        shifted_mask[:, :-1] = mask[:, 1:]
+        # shifted_mask = nn.functional.pad(shifted_mask, (0, 1), value=0)
+    
+        
+        # Mask padding and ignored tokens
+        shifted_mask[shifted_labels == self.train_dataset.ignore_index] = 0.0
+        shifted_mask[shifted_labels == self.train_dataset.pad_token_id] = 0.0
+        
+        # Cross-entropy loss with masking
+        loss_fct = nn.CrossEntropyLoss(reduction='none')
+        loss = loss_fct(logits.view(-1, logits.size(-1)), shifted_labels.view(-1))
+        masked_loss = (loss * shifted_mask.view(-1)).sum() / shifted_mask.sum().clamp(min=1e-8)
+        print(f"Masked Loss: {masked_loss.item()}")
+        return (masked_loss, outputs) if return_outputs else masked_loss
 
 def get_class_labels(dataset):
     labels = []
@@ -136,11 +187,12 @@ def create_sampler(weights):
 #         return (loss, outputs) if return_outputs else loss
 
 class ManualEvalCallback(TrainerCallback):
-    def __init__(self, eval_dataset, tokenizer, eval_every_n_steps=500, batch_size=1):
+    def __init__(self, eval_dataset, tokenizer, eval_every_n_steps=500, batch_size=1, answer_token_id = 193800):
         self.eval_dataset = eval_dataset
         self.tokenizer = tokenizer
         self.eval_every_n_steps = eval_every_n_steps
         self.batch_size = batch_size
+        self.answer_token_id = answer_token_id
 
     def on_step_end(self, args, state, control, **kwargs):
         if state.global_step % self.eval_every_n_steps == 0 and self.eval_dataset is not None:
@@ -238,12 +290,12 @@ def run_manual_evaluation(model, dataloader, tokenizer, device):
 
             for p_seq, l_seq in zip(pred_ids, labels):
                 try:
-                    answer_pos = np.where(l_seq != -100)[0]
+                    answer_pos = np.where(l_seq == answer_token_id)[0]
                     if len(answer_pos) == 0 or answer_pos[0] + 1 >= len(l_seq):
                         continue
 
-                    pred_label = p_seq[answer_pos[0]]
-                    true_label = l_seq[answer_pos[0]]
+                    pred_label = p_seq[answer_pos[0]+1]
+                    true_label = l_seq[answer_pos[0]+1]
 
                     if true_label == -100:
                         continue
@@ -398,13 +450,10 @@ class TTSDataset(Dataset):
 
         speech_understanding_end_positions = (input_ids == self.speech_understanding_end_id).nonzero(as_tuple=True)[0]
         speech_understand_end_idx = speech_understanding_end_positions[0].item()
-
         text_speech_sequence = input_ids[:speech_understand_end_idx + 1]
        
         answer_start_positions = (input_ids == self.answer_start_id).nonzero(as_tuple=True)[0]
         answer_start_idx = answer_start_positions[0].item()
-        
-        # speech_understand_end_idx = speech_understanding_end_positions[0].item()
         answer_sequence = input_ids[answer_start_idx:]
 
         chat = [
@@ -412,23 +461,24 @@ class TTSDataset(Dataset):
             {"role": "assistant", "content": "<|ANSWER|>"}
         ]
         ids = self.tokenizer.apply_chat_template(chat, tokenize=True)
-
         ids = self.replace_tagged_token(ids, self.text_understanding_start_id, text_speech_sequence)
         ids = self.replace_tagged_token(ids, self.answer_start_id, answer_sequence)
 
         input_ids = torch.tensor(ids, dtype=torch.long)
-        labels = torch.full_like(input_ids, self.ignore_index)
+        labels = torch.tensor(ids, dtype=torch.long)  # Copy input_ids to labels for all tokens
 
         try:
             answer_idx_in_input = (input_ids == self.answer_start_id).nonzero(as_tuple=True)[0].item()
-            labels[answer_idx_in_input+1:] = input_ids[answer_idx_in_input+1:]
+            # Optionally exclude chat template tokens before <|TEXT_UNDERSTANDING_START|>
+            text_start_idx = (input_ids == self.text_understanding_start_id).nonzero(as_tuple=True)[0]
+            if len(text_start_idx) > 0:
+                labels[:text_start_idx[0]] = self.ignore_index  # Ignore chat template tokens
         except Exception as e:
-            print(f"maybe Error in speech_gen_idx_in_input: {e}")
-            labels = input_ids 
+            print(f"Error in answer_idx_in_input: {e}")
+            labels = torch.full_like(input_ids, self.ignore_index)
 
         attention_mask = (input_ids != self.pad_token_id).long()
         labels[input_ids == self.pad_token_id] = self.ignore_index
-        #labels[answer_idx_in_input+2] = self.pad_token_id
 
         input_ids = self.pad_sequence(input_ids, self.max_length, value=self.pad_token_id)
         attention_mask = self.pad_sequence(attention_mask, self.max_length, value=0)
